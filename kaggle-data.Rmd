@@ -1,0 +1,682 @@
+---
+output:
+  html_document:
+    df_print: paged
+  pdf_document: default
+---
+
+```{r setup, include=FALSE, warning=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+library(plotly)
+library(dplyr)
+library(ggplot2)
+library(tidyr)
+library(glmnet)
+library(caret)
+library(pROC)
+library(cluster)
+library(countrycode)
+library(merTools)
+library(lme4)
+set.seed(111)
+```
+## Dataset
+Load the dataset from the CSV file, rename some columns, drop any rows with missing values and make any relevant variables factors.
+(Dropping all rows with NA is not ideal, but it is sufficient for the purpose of this coursework.)
+```{r clean_data}
+data <- read.csv("Life Expectancy Data.csv") %>% rename(
+    LifeExpectancy = `Life.expectancy`, AdultMortality = `Adult.Mortality`,
+    InfantDeaths = `infant.deaths`,
+    PercentageExpenditure = `percentage.expenditure`, HepatitisB = `Hepatitis.B`,
+    UnderFiveDeaths = `under.five.deaths`, TotalExpenditure = `Total.expenditure`,
+    HIVAIDS = `HIV.AIDS`, ThinnessOneNineteenYears = `thinness..1.19.years`,
+    ThinnessFiveNineYears = `thinness.5.9.years`,
+    IncomeCompositionOfResources = `Income.composition.of.resources`
+  ) %>% drop_na() %>% mutate(
+    Country = as.factor(Country), Status = as.factor(Status),
+  ) %>% filter( # per 1,000 so more than 1,000 is invalid
+    UnderFiveDeaths <= 1000, InfantDeaths <= 1000,
+  )
+```
+
+**1) Carefully constructed numerical and graphical summaries (using ggplot) of 5 relevant variables. [10 points]**
+
+**Under Fives Deaths**
+```{r summarise_under_fives}
+summarise(data,
+  mean = mean(UnderFiveDeaths), median = median(UnderFiveDeaths), sd = sd(UnderFiveDeaths)
+)
+```
+```{r plot_under_fives}
+ggplot(data, aes(x = UnderFiveDeaths)) +
+  geom_histogram(alpha = 0.5, position = "identity", binwidth = 50) +
+  labs(
+    x = "Number of under-five deaths per 1000 population", 
+    title = "Histogram of deaths in under fives"
+  )
+```
+
+**Status**
+```{r table_status}
+table(data$Status)
+```
+
+1396 observations are developing countries, and 242 are developed. It might be more useful to know how many countries are in the dataset at each level.
+```{r table_countries_per_status}
+data %>% group_by(Status) %>% summarise(NumberCountries = n_distinct(Country))
+```
+
+Two versions of the histogram above can be plotted for deaths in under 5 year olds, one for each status level.
+```{r plot_under_fives_by_status}
+ggplot(data, aes(x = UnderFiveDeaths)) +
+  geom_histogram(alpha = 0.5, position = "identity", binwidth = 25) + 
+  facet_grid(Status ~ .) + scale_x_continuous(
+    "Under Five Deaths per 1,000 population", breaks = seq(0, max(data$UnderFiveDeaths), 200)
+  ) +
+  labs(title = "Histogram of deaths in under fives by development status")
+```
+
+This shows that developed countries have very few deaths in under fives.
+
+**GDP**
+```{r gdp_by_status}
+data %>% group_by(Status) %>% summarise(
+    min = min(GDP), max = max(GDP), mean = mean(GDP), median = median(GDP), sd = sd(GDP),
+  )
+```
+
+`GDP` in developed countries is seen to be considerably higher. It would be interesting to see how this correlates with deaths under five.
+```{r plot_gdp}
+ggplot(data, aes(x = GDP, y = UnderFiveDeaths, color = Status)) + geom_point() + 
+  theme_classic() + labs(
+    y = "Number of under-five deaths per 1000 population",
+    x = "Gross Domestic Product per capita (in USD)", 
+    title = "GDP vs Under Five Deaths by Status"
+  )
+```
+
+Little can be determined from this graph, but a lower GDP correlates with a higher number of under five deaths, whereas once GDP is greater than approximately 20,000 the deaths in under fives is almost zero. This is probably not solely due to GDP. There are still a number of countries with low GDP with a low number of under fives deaths, however the variance increases.
+
+**HIV/AIDs**
+```{r summaries_HIV}
+data %>% summarise(min = min(HIVAIDS), max = max(HIVAIDS), 
+                   mean = mean(HIVAIDS), median = median(HIVAIDS), sd = sd(HIVAIDS))
+```
+
+Generally the prevalence of HIV/AIDs is quite low, however the standard deviation is quite high. This can be plotted against the year.
+```{r plot_HIV}
+ggplot(data, aes(x = Year, y = HIVAIDS, color = Status)) + geom_point() + theme_classic() +
+  labs(
+    y = "Deaths per 1 000 live births HIV/AIDS (0-4 years)", 
+    title = "Year vs HIV/AIDS by Status"
+  ) + scale_x_continuous(breaks = seq(2000, 2015, 2))
+```
+
+This plot, suggests time does have some effect, but with significant variance, probably due to different countries. The points of developed countries cannot be seen, as they all have a value of 0.1.
+```{r summarise_HIV_by_status}
+data %>% filter(Status == "Developed") %>% group_by(HIVAIDS) %>% summarise(n = n())
+```
+
+It would be more useful to make a bar chart, by year. The developed countries have been removed here as they have no input.
+```{r plot_HIV_developing}
+data %>% filter(Status == "Developing") %>%
+  ggplot(aes(x = Year, y = HIVAIDS)) + geom_bar(stat = "identity") + theme_classic() +
+  scale_x_continuous(breaks = seq(2000, 2015, 2)) + labs(
+      y = "Deaths per 1 000 live births HIV/AIDS (0-4 years)",
+      title = "Year vs HIV/AIDS in Developing Countries"
+  )
+```
+
+This suggests, time does have an input, but it is not strictly decreasing with time. HIV/AIDs rates built until approximately 2005, and then fell.
+
+**Measles**
+```{r summaries_measles}
+data %>% summarise(min = min(Measles), max = max(Measles), mean = mean(Measles), 
+                   median = median(Measles), sd = sd(Measles))
+```
+
+Measles prevalence is quite varied, it would be interesting to see if a country's status has an effect.
+```{r summarise_measles_by_status}
+data %>% group_by(Status) %>%
+  summarise(min = min(Measles), max = max(Measles), mean = mean(Measles), 
+            median = median(Measles), sd = sd(Measles))
+```
+
+It does have an effect and it is not insignificant. The maximum value in developed countries is more than 10x higher than the mean in developing countries. Therefore, there is clearly prevalence of measles in developed countries and it can't be ignored. The data can be further explored to see the affect of time.
+```{r plot_measles}
+ggplot(data, aes(x = Year, y = Measles)) + geom_bar(stat = "identity") + theme_classic() +
+  labs(
+    y = "Measles - number of reported cases per 1000 population",
+    title = "Prevalance of measles in developed countries vs year"
+  )
+```
+
+There are variations, but not a specific trend.
+```{r plot_measles_by_status}
+data %>%
+  group_by(Status, Year) %>% summarise(mean = mean(Measles), .groups = "drop") %>%
+  ggplot(aes(x = Year, y = mean, fill = Status)) +
+  geom_bar(stat = "identity", position = position_dodge(preserve = "single")) + 
+  theme_minimal() + labs(
+    x = "Year", y = "Measles - number of reported cases per 1000 population",
+    title = "Average measles cases in a country by year grouped by status"
+  )
+```
+
+In developing countries, from approximately 2005 there is definitely a downwards trend. In developed countries, there is not a clear trend.
+
+**2) Use the ggplot package to construct the following plots:**
+
+  **a) A scatterplot with two continuous variables, where points are coloured based on a categorical variable.  [5 points]**
+  
+This plot shows general government expenditure on health as a percentage of total government expenditure against the number of infant deaths. There is a strong increase in infant deaths when expenditure is small. When expenditure is less than 1,000, all infant deaths greater than approximately 50 occur.
+The items are coloured based on developed/developing country. 
+```{r plot_pct_expenditure_vs_infant_deaths}
+ggplot(data, aes(x = PercentageExpenditure, y = InfantDeaths, color = Status)) +
+  geom_point() + theme_classic() + labs(
+    x = "Expenditure on health as a percentage of GDP per capita (%)",
+    y = "Number of infant deaths per 1000 population",
+    title = "Number of infant deaths vs percentage expenditure grouped by status"
+  )
+```
+  
+  **b) A bar chart with error bars [5 points]**
+```{r plot_hiv_aids}
+data %>% group_by(Year) %>%
+  summarise(
+    mean = mean(HIVAIDS), sd = sd(HIVAIDS),
+    ci_lower = mean - qt(0.975, df = n() - 1) * sd / sqrt(n()),
+    ci_upper = mean + qt(0.975, df = n() - 1) * sd / sqrt(n())
+  ) %>%
+  ggplot(aes(x = Year, y = mean)) + geom_bar(stat = "identity", fill = "steelblue") +
+  geom_errorbar(aes(ymin = ci_lower, ymax = ci_upper), width = 0.2) + theme_classic() +
+  labs(
+    title = "HIV/AIDs deaths over time",
+    y = "Deaths per 1,000 live births HIV/AIDS (0-4 years)", x = "Year"
+  )
+```
+ 
+  **c) A plot showing overlapping histograms for two different groups.    Ensure the transparency setting allows for visibility of both distributions. [5 points]**
+```{r plot_schooling}
+ggplot(data, aes(x = Schooling, color = Status, fill = Status)) +
+  geom_histogram(alpha = 0.25, position = "identity", binwidth = 0.5) +
+  labs(
+    x = "Number of years of schooling (years)", y = "Count",
+    title = "Histogram of number of years of schooling over time by status"
+  )
+```
+
+**3) Fit, evaluate, interpret, and compare two logistic models. Both models should focus on the same response variable and include at least two predictors. [10 points]**
+
+A training/testing split will be built now as the model should only be fitted on a subset of the data.
+```{r train_test_split}
+training_samples <- createDataPartition(data$Status, p = 0.8, list = FALSE)
+training_data <- data.frame(data[training_samples, ])
+test_data <- data.frame(data[-training_samples, ])
+names(training_data) <- names(data)
+names(test_data) <- names(data)
+```
+
+Two models will be built to predict the `Status` column, which is a factor of two levels: Developed or Developing.
+The predictors are  `Alcohol`, `GDP` and `Schooling.`
+```{r logistic_model_status}
+logistic_model1 <- glm(
+  Status ~ Alcohol + GDP + Schooling, family = binomial, data = data
+)
+logistic_model1$coefficients
+```
+
+To interpret these coefficients, it is necessary to take the exponent of these values.
+```{r coefficients_logistic_model_status}
+exp(logistic_model1$coefficients)
+```
+This is interpreted as:
+
+* An increase in alcohol consumption by 1 litre of alcohol (per capita) predicts the odds of a country being a developing country to multiply by 0.675 (approx. 32.5% decrease), assuming all other variables remain constant.
+* An increase in GDP by 1USD per capita predicts the odds of a country being a developing country to multiply by 0.999 (approx. 0.001% decrease), assuming all other variables remain constant.
+* An increase in schooling by 1 year predicts the odds of a country being a developing country to multiply by 0.585 (approx. 41.5% decrease), assuming all other variables remain constant.
+
+The predictors used for the next model will be life expectancy, adult mortality, alcohol, hepatitis B, total expenditure, GDP, income consumption of resources, and schooling.
+```{r logistic_model_2_status}
+logistic_model2 <- glm(
+  Status ~
+    LifeExpectancy + AdultMortality + Alcohol + HepatitisB + TotalExpenditure +
+    GDP + IncomeCompositionOfResources + Schooling, family = binomial, data = data
+)
+logistic_model2$coefficients
+```
+
+To interpret these coefficients take the exponent of these values:
+```{r logistic_model_2_coefficients}
+exp(logistic_model2$coefficients)
+```
+
+This is interpreted as:
+
+* An increase in life expectancy by 1 year predicts the odds of a country being a developing country to multiply by 0.987 (approx. 1.3% decrease), assuming all other variables remain constant.
+* An increase in adult mortality by 1 death per 1000 aged 15-60 predicts the odds of a country being a developing country to multiply by 1.0078 (approx. 0.78% increase), assuming all other variables remain constant.
+* An increase in alcohol consumption by 1 liter of alcohol (per capita) predicts the odds of a country being a developing country to multiply by 0.669 (approx. 33.1% decrease), assuming all other variables remain constant.
+* An increase in hepatitis B immunisation coverage by 1% amongst 1-year-olds predicts the odds of a country being a developing country to multiply by 0.967 (approx. 3.3% decrease), assuming all other variables remain constant.
+* An increase in total expenditure on health as a percentage of GDP by 1% predicts the odds of a country being a developing country to multiply by 0.976 (approx. 2.4% decrease), assuming all other variables remain constant.
+* An increase in GDP by 1USD per capita predicts the odds of a country being a developing country to multiply by 1.000009 (approx. 0.0001% increase), assuming all other variables remain constant.
+* An increase in Human Development Index in terms of income composition of resources by 1 unit predicts the odds of a country being a developing country to multiply by 1.34×10−9 (negligible), assuming all other variables remain constant.
+* An increase in schooling by 1 year predicts the odds of a country being a developing country to multiply by 1.109068 (approx. 10.91% increase), assuming all other variables remain constant.
+
+An ROC curve can now be plotted for each model to determine the best cut-off for each model. This process is once again carried out on the training data.
+```{r roc_predictions}
+roc_predictions1 <- roc(
+  response = training_data$Status, plot = TRUE, auc = TRUE,
+  predictor = predict(logistic_model1, newdata = training_data, type = "response"),
+  main = "ROC Curve for prediction of status using `logistic_model1"
+)
+roc_predictions2 <- roc(
+  response = training_data$Status, plot = TRUE, auc = TRUE,
+  predictor = predict(logistic_model2, newdata = training_data, type = "response"),
+  main = "ROC Curve for prediction of status using `logistic_model2"
+)
+```
+
+Predictions will now be made on both models using the test data. A data frame will be created with three columns: the first column will contain the `logistic_model1` prediction of the probability that it is a developing country, the second column will have the same but for the `logistic_model2` column, and the final column will contain the actual value.
+```{r df_predictions_logistic_models}
+predictions <- data.frame(
+  Prediction1 = predict(logistic_model1, newdata = test_data, type = "response"),
+  Prediction2 = predict(logistic_model2, newdata = test_data, type = "response"),
+  Status = test_data$Status
+)
+```
+
+The best Youden threshold for each model can be determined.
+```{r find_youden}
+threshold1 <- coords(
+  roc_predictions1, "b", best.method = "youden", transpose = TRUE
+)[1]
+threshold2 <- coords(
+  roc_predictions2, "b", best.method = "youden", transpose = TRUE
+)[1]
+```
+
+With the Youden thresholds, the predictions data frame can be updated to reflect the best values, and then some error metrics can be obtained.
+```{r confusion_matrix_logistic}
+predictions <- predictions %>% mutate(
+    Prediction1 = as.factor(if_else(Prediction1 > threshold1, "Developing", "Developed")),
+    Prediction2 = as.factor(if_else(Prediction2 > threshold2, "Developing", "Developed"))
+  )
+confusionMatrix(data = predictions$Prediction1, test_data$Status)
+confusionMatrix(data = predictions$Prediction2, test_data$Status)
+```
+
+Both models perform well on a test data set. With the `logistic_model1` having a slightly lower accuracy at 89.91%, whilst the `logistic_model2` had an accuracy of 92.66%. The `logistic_model1` has a Youden's Index of 1 + 1 - 0.8817 = 1.1183. This means it correctly predicted 100% developed countries (sensitivity), but only accurate on 88.17% (specificity) of the developing countries. The `logistic_model2` had a slightly lower Youden's Index of 1 + 0.9583 - 0.9211 = 1.0372 This means it correctly predicted 95.83% (sensitivity) of developed countries and 92.11% (specificity) of developing countries. 
+Although a higher accuracy was achieved by the `logistic_model2`, it is not considerably better than the other model. Its higher accuracy is likely due to its better ability at predicting developing countries, which are more prevalent in the dataset. Both models could be found useful in different contexts.
+
+**4) Fit, evaluate, interpret, and compare two linear mixed effect models. Both models should focus on the same response variable and include at least one predictor and one random effect. [15 points]**
+
+First add the `Continent` column to the data-frame(s).
+```{r add_continent}
+data$Continent <- countrycode(
+  data$Country, origin = "country.name", destination = "continent"
+) %>% as.factor()
+training_data$Continent <- countrycode(
+  training_data$Country, origin = "country.name", destination = "continent"
+) %>% as.factor()
+test_data$Continent <- countrycode(
+  test_data$Country, origin = "country.name", destination = "continent"
+) %>% as.factor()
+```
+
+Build a model of life expectancy using continent as a random effect, and schooling, under fives deaths, and status as fixed effects.
+```{r mixed_effect_model_life_expectancy}
+mixed_mod <- lmer(
+  LifeExpectancy ~ Schooling + UnderFiveDeaths + Status + (1 | Continent), data = training_data,
+)
+mixed_mod
+```
+
+This tells us that the mean life expectancy for a developed country with zero years of schooling and zero under five deaths is 54.45, and the standard deviation of the effect of continent was 3.652, the residual standard deviation is 5.033. So the continent does have some effect, but this may not be the best model. 
+Further, each year of school is associated with an increase in life expectancy by approximately 1.408 years, but one under five death is associated with a decrease in life expectancy by approximately 0.007 years, being a developing country is associated with 2.99 years lower life expectancy.
+The effect of continent can be estimated: 
+```{r random_effects_continent}
+ranef(mixed_mod)$Continent
+```
+
+In general countries in Africa have a life expectancy of 6.05 less than average, whereas in the Americas it is 3.29 more, Europe 1.48 more, Asia 1.70 more and Oceania the difference is negligible of -0.4. (If all `HepatitisB`, `Measles`, `Polio` and `HIVAIDS` remain constant).
+The homoscedasticity of the model can be examined. It shows homoscedasticity at each value of `Schooling`, with some outliers showing less homogeneity. A similar situation is observed for `UnderFiveDeaths`, although it is challenging to read at low values. Even after filtering to these lower values, homoscedasticity is still evident.
+```{r plot_residuals_mixed_effect}
+ggplot(
+  data.frame(Schooling = training_data$Schooling, wtres = mixed_mod@resp$wtres)) +
+  geom_point(aes(x = Schooling, y = wtres)) +
+  labs(x = "Schooling", y = "Weighted Residuals", title = "Schooling vs weighted residuals")
+ggplot(data.frame(UnderFiveDeaths = training_data$UnderFiveDeaths, wtres = mixed_mod@resp$wtres)) +
+  geom_point(aes(x = UnderFiveDeaths, y = wtres)) +
+  labs(x = "Number of under-five deaths per 1000 population", y = "Weighted Residuals", 
+       title = "Under five deaths vs weighted residuals")
+ggplot(
+  data.frame(UnderFiveDeaths = training_data$UnderFiveDeaths, wtres = mixed_mod@resp$wtres
+  )) +
+  geom_point(aes(x = UnderFiveDeaths, y = wtres)) +
+  labs(x = "Number of under-five deaths per 1000 population", y = "Weighted Residuals", 
+       title = "Under five deaths (less than 20) vs weighted residuals") + xlim(0, 20)
+```
+
+Checking against status can be done too. The standard deviations for each level of status are not greatly different (approximately 25% higher for developing countries). This is acceptable, especially considering the considerably larger number of developing countries in the dataset.
+```{r plot_residual_status_mixed_effect}
+data_df <- data.frame(wtres = mixed_mod@resp$wtres, Status = training_data$Status)
+ggplot(data_df, aes(x = Status, y = wtres)) +
+  geom_boxplot() + labs(
+    x = "Developed or Developing status", y = "Weighted Residuals",  
+    title = "Boxplot of Weighted Residuals by Status"
+  )
+mixed_moddf <- data.frame(training_data$Status, mixed_mod@resp$wtres)
+names(mixed_moddf) <- c("Status", "residual")
+mixed_moddf %>% group_by(Status) %>% summarise(sd(residual))
+```
+
+Checking the normality of the residuals, looks pretty good.
+```{r qqplot_mixed_mod}
+qqnorm(mixed_moddf$residual)
+```
+
+Using the model to make some predictions on the test set, and report some error metrics.
+```{r predictions_mixed_mod}
+test_preds <- predictInterval(mixed_mod, newdata = test_data)
+data.frame(
+  R2 = R2(test_preds$fit, test_data$LifeExpectancy),
+  RMSE = RMSE(test_preds$fit, test_data$LifeExpectancy),
+  MAE = MAE(test_preds$fit, test_data$LifeExpectancy)
+)
+sqrt(R2(test_preds$fit, test_data$LifeExpectancy))
+```
+
+The model has a R^2 of 0.6785 on the test set, which means there is a correlation of about 0.8237 between the predicted life expectancy and the actual life expectancy. This is fairly good but could be better. There is a mean absolute error of 3.8403.
+It is useful to plot the expected versus the predicted value, with prediction bands.
+```{r plot_predictions_mixed_mod}
+plot_data <- data.frame(
+  Predicted = test_preds$fit, Actual = test_data$LifeExpectancy,
+  lwr = test_preds$lwr, upr = test_preds$upr
+)
+ggplot(plot_data, aes(x = Predicted, y = Actual)) +
+  geom_point() + geom_abline(intercept = 0, slope = 1, color = "red") +
+  labs(title = "Model predicted vs actual life expectancy",
+       x = "Predicted Life Expectancy (years)", y = "Actual Life Expectancy (years)"
+  ) + geom_line(aes(y=lwr), lty = 2) + geom_line(aes(y = upr), lty = 2)
+```
+
+It is possible to view the confidence intervals, for each variable.
+```{r confidence_interval_mixed_mod}
+confint(mixed_mod)
+```
+
+For the second model, first, building the model with `HepatitisB`, `Measles`, `Polio`, and `HIVAIDS` as fixed effects and continent as a random effect:
+```{r mixed_mod2}
+mixed_mod_2 <- lmer(
+  LifeExpectancy ~ HepatitisB + Measles + Polio + HIVAIDS + (1 | Continent), 
+  data = training_data
+)
+summary(mixed_mod_2)
+```
+
+This show the mean life expectancy for a country with zero years of schooling and zero under five deaths is 65.49, the standard deviation of the effect of continent was 4.684, the residual standard deviation is 5.240. The continent does have some effect, but again this may not be the best model. It suggests a better ratio than in the first model.
+Further, each unit of `HepatitisB`, `Measles`, `Polio` and `HIVAIDS` is associated with an increase in life expectancy by 0.01028, -0.00002565, 0.05673 and -0.5244 years respectively.
+It is possible to estimate the effect of continent. 
+```{r random_effects_continent2}
+ranef(mixed_mod_2)$Continent
+```
+
+In general countries in Africa have a life expectancy of -7.15 less than average, whereas in Americas it is 2.72 more, Europe 5.32 more, Asia 0.535 less and Oceania 0.349 less. (If all `HepatitisB`, `Measles`, `Polio` and `HIVAIDS` remain constant). 
+The homoscedasticity of the model can be examined. It shows homoscedasticity at each value of `HepatitisB`, `Measles` and `Polio`. For `HIVAIDs`, there appears to be an upwards trend at higher values. However, it is not particularly significant and probably acceptable
+```{r plot_residuals_mixed_effect2}
+ggplot(
+  data.frame(HepatitisB = training_data$HepatitisB, wtres = mixed_mod_2@resp$wtres)
+  ) + geom_point(aes(x = HepatitisB, y = wtres)) + labs(
+    x = "Hepatitis B (HepB) immunization coverage among 1-year-olds (%)",
+    y = "Weighted Residuals", title = "HepatitisB vs Weighted Residuals"
+  )
+ggplot(
+  data.frame(Measles = training_data$Measles, wtres = mixed_mod_2@resp$wtres)) +
+  geom_point(aes(x = Measles, y = wtres)) + labs(
+    x = "Measles - number of reported cases per 1000 population",
+    y = "Weighted Residuals", title = "Measles vs Weighted Residuals"
+  )
+ggplot(
+  data.frame(Polio = training_data$Polio, wtres = mixed_mod_2@resp$wtres)) +
+  geom_point(aes(x = Polio, y = wtres)) + labs(
+    x = "Polio (Pol3) immunization coverage among 1-year-olds (%)",
+    y = "Weighted Residuals", title = "Polio vs Weighted Residuals"
+  )
+ggplot(
+  data.frame(HIVAIDS = training_data$HIVAIDS, wtres = mixed_mod_2@resp$wtres)) +
+  geom_point(aes(x = HIVAIDS, y = wtres)) +
+  labs(
+    x = "Deaths per 1 000 live births HIV/AIDS (0-4 years)",
+    y = "Weighted Residuals", title = "HIVAIDS vs Weighted Residuals"
+  )
+```
+
+It is possible to make predictions on the test set:
+```{r preds_mixed_mod2}
+test_preds2 <- predictInterval(mixed_mod_2, newdata = test_data)
+data.frame(
+  R2 = R2(test_preds2$fit, test_data$LifeExpectancy),
+  RMSE = RMSE(test_preds2$fit, test_data$LifeExpectancy),
+  MAE = MAE(test_preds2$fit, test_data$LifeExpectancy)
+)
+sqrt(R2(test_preds2$fit, test_data$LifeExpectancy))
+```
+
+The model has a R^2 of 0.6794 on the test set, which means there is a correlation of about 0.8242 between the predicted life expectancy and the actual life expectancy. This is comparable to the first model and is fairly good but could be better. There is a mean absolute error of 3.9382, which is again very similar to the first model. The expected value can be plotted against the predicted value, with prediction bands:
+```{r plot_predictions_mixed_mod2}
+ggplot(
+  data.frame(
+    Predicted = test_preds2$fit, Actual = test_data$LifeExpectancy,
+    upr = test_preds2$upr, lwr = test_preds2$lwr
+  ), aes(x = Predicted, y = Actual)
+  ) + geom_point() + geom_abline(intercept = 0, slope = 1, color = "red") +
+  labs(
+    x = "Predicted Life Expectancy (years)", y = "Actual Life Expectancy (years)",
+    title = "Predicted vs Actual Life Expectancy with line representing correct predictions"
+  ) + geom_line(aes(y=lwr), lty = 2) + geom_line(aes(y = upr), lty = 2)
+```
+
+It is possible to view the confidence intervals, for each variable.
+```{r confidence_interval_mixed_mod2}
+confint(mixed_mod_2)
+```
+
+Some of these confidence intervals are quite large, even different orders of magnitude.
+
+**5) Fit, evaluate, interpret a Lasso penalised regression model. [10 points]**
+
+Two linear models will be created to predict the `Schooling` attribute of a data point.
+Initially, a generalised linear model, it is possible to create a plot to see how much of the deviance is explained as more coefficients are added.
+```{r lasso_model}
+response <- as.vector(training_data$Schooling)
+predictors <- model.matrix(~. - Schooling, data = training_data)[, -1]
+glm_init <- glmnet(predictors, response, family = "gaussian")
+par(mar = c(5, 4, 6, 2))
+plot(glm_init, xvar = "dev", main = "Deviance Explained vs log(lambda)")
+```
+
+To choose a lambda `cv.glmnet` is used to find the optimal values.
+```{r choose_lambda_lasso}
+glm_cv <- cv.glmnet(predictors, response)
+par(mar = c(5, 4, 6, 2))
+plot(glm_cv, main = "Cross-Validated Mean Squared Error vs. Log(lambda)")
+```
+
+It is observed that a log(lambda) value between -8 and -6 is optimal in this case. It is logical to select the lambda value that yields the smallest error. With 153 predictors at this lambda, they can be identified.
+```{r find_predictors}
+coef(glm_init, s = glm_cv$lambda.min)@Dimnames[[1]][1 + coef(glm_init, s = glm_cv$lambda.min)@i]
+```
+
+This has:
+
+* Most of the levels for `Country`
+* `Year`
+* 1 level for `Status` (1/2 so include it)
+* `LifeExpectancy`
+* `AdultMortality`
+* `InfantDeaths`
+* `Alcohol`
+* `PercentageExpenditure`
+* `HepatitisB`
+* `Measles`
+* `BMI`
+* `UnderFiveDeaths`
+* `Polio`
+* `TotalExpenditure`
+* `Diphtheria`
+* `HIVAIDS`
+* `GDP`
+* `Population`
+* `ThinnessOneNineteenYears`
+* `ThinnessFiveNineYears`
+* `IncomeCompositionOfResources`
+
+A model is created with these variables.
+```{r create_lasso_mod}
+lasso_model <- glm(Schooling ~
+    Country + Year + Status + LifeExpectancy + AdultMortality + InfantDeaths +
+    Alcohol + PercentageExpenditure + HepatitisB + Measles + BMI +
+    UnderFiveDeaths + Polio + TotalExpenditure + Diphtheria + HIVAIDS + GDP +
+    Population + ThinnessOneNineteenYears + ThinnessFiveNineYears +
+    IncomeCompositionOfResources, family = "gaussian", data = training_data)
+summary(lasso_model)$coefficients[,"Estimate"]
+```
+
+These coefficients can be interpreted as, for individual countries, a change in the country for the data point from the baseline country (Afghanistan) to another corresponds to a change of that many years in schooling. For example, if a data point changes its country from Afghanistan to Zambia (while keeping all other factors constant), an increase of 2.637 years in education would be expected.
+For the `Status` predictor a value of NA is shown, this means that it has no input into expected number of years of schooling. This is probably because it is colinear with another predictor variable.
+All other columns follow a similar pattern such that a one-unit change in that variable, whilst all others remain the same, is associated with an increase in number of years in schooling by the coefficient. For example, `LifeExpectancy = 0.02009` implies that for every one year increase in life expectancy, there is a correlated increase in years of schooling by 0.2009 years, assuming all other predictors remain constant.
+A histogram of the residuals of this model shows a bell curve with a mean of 0 (up to a rounding error), and a standard deviation of 0.5243.
+```{r residual_lasso}
+residuals_df <- data.frame(Residuals = lasso_model$residuals)
+ggplot(residuals_df, aes(x = Residuals)) +
+  geom_histogram(alpha = 0.5, position = "identity", binwidth = 0.1) +
+  labs(title = "Histogram of Residuals", x = "Residuals", y = "Frequency") + theme_minimal()
+mean(lasso_model$residuals)
+sd(lasso_model$residuals)
+```
+
+Plotting a line on the QQ plot with an intercept of 0 and a gradient of the standard deviation of the residuals, shows a good fit. There is again a trend away from this line at extreme values.
+```{r qqplot_lasso}
+qqnorm(lasso_model$residual)
+abline(0, sd(lasso_model$residuals), col = 2)
+```
+
+Testing the data on the test set:
+```{r predictions_lasso}
+predictions <- predict(lasso_model, newdata = test_data)
+data.frame(
+  R2 = R2(predictions, test_data$Schooling),
+  RMSE = RMSE(predictions, test_data$Schooling),
+  MAE = MAE(predictions, test_data$Schooling)
+)
+```
+
+The model has a R^2 of 0.965 on the test set, which means there is a very good correlation of about 0.98 between the predicted number of years in school and the actual number of years.
+```{r r2_lasso}
+sqrt(R2(predictions, test_data$Schooling))
+```
+
+These numbers can be compared to the training data.
+```{r training_predictions_lasso}
+train_predictions <- predict(lasso_model, newdata = training_data)
+data.frame(
+  R2 = R2(train_predictions, training_data$Schooling),
+  RMSE = RMSE(train_predictions, training_data$Schooling),
+  MAE = MAE(train_predictions, training_data$Schooling)
+)
+sqrt(R2(train_predictions, training_data$Schooling))
+```
+
+This is little / no change in the error on the test set, which indicates the model is not over fitting.
+From this analysis, this appears to be a very good model at predicting the numbers of years a student spends in school. It performs less well at extremely small and large values, but that could be expected due to less data in these columns.
+
+**Using a clustering method seen in class, explore whether the data tend to form clusters and describe your findings. [10 points]**
+
+A subset of relevant variables is first selected from the dataset. Only numerical variables have been chosen, although factors such as `Status` could be selected if they were converted to `numeric` using the `as.numeric` command.
+The data will also be scaled, ensuring that some columns are not overly weighted due to their larger values.
+```{r select_cluster_cols}
+# use dplyr:: as plotly has a select function that interferes
+cluster_data <- dplyr::select(data, c(LifeExpectancy, Schooling, UnderFiveDeaths)) %>% scale()
+```
+
+K-Means clustering is being used to cluster the data around two centers. One cluster contains 1065 data points, while the other contains 573. This distribution is not particularly balanced but might not pose a problem in the context of the dataset.
+```{r create_kmeans}
+kmeans_model <- kmeans(cluster_data, centers = 2)
+clusters <- kmeans_model$cluster
+data$cluster <- as.factor(clusters)
+table(clusters)
+```
+
+It is possible to extract the centers, although this is not particularly meaningful due to the fact it is scaled. The unscaled centers are useful.
+```{r unscaled_centers}
+scales <- attr(cluster_data, "scaled:scale")
+scaled_centers <- attr(cluster_data, "scaled:center")
+unscaled_centers <- data.frame(t(t(kmeans_model$centers) * scales + scaled_centers))
+unscaled_centers
+```
+
+It could be that the cluster assignment is somewhat associated with the `Status` variable.
+It is useful to plot a box plot to see if this is the case. The box plot is ambiguous, it could suggest these cluster are associated with the `Status` variable as developed countries are only in cluster 1. However, it is not a good method for determining the status of a country as most developing countries are also in cluster 1.
+```{r plot_status_b_cluster}
+ggplot(data, aes(x = Status)) +
+  geom_histogram(alpha = 0.5, position = "identity", stat = "count") + facet_grid(cluster ~ .) + labs(
+    title = "Histogram of development group of countries in each cluster"
+  )
+```
+
+A silhouette plot shows an average silhouette width of 0.34, which suggests objects in a cluster have a weak similarity to objects in there own cluster compared to those in other clusters. This suggests the model is not particularly good.
+```{r silhouette_plot}
+sil <- silhouette(as.numeric(data$cluster), daisy(data, metric = "gower"))
+plot(sil, col = c("blue", "green"), border = NA, main = "Silhoutte Plot")
+abline(v = mean(sil[, 3]), lty = 2)
+```
+
+The k-means model has a total within cluster sum of squares of 2767.9, compared to 4911 of that if 1 center was used. This is an improvement, but is not significant.
+```{r within_sum_squares_clusters}
+kmeans_model$tot.withinss
+kmeans(cluster_data, centers = 1)$tot.withinss
+```
+
+The data can be visualised in 3 dimensions. (This plot is interactive in RStudio/HTML but not PDF)
+```{r 3d_plot_kmeans}
+plot_ly(data, x = ~LifeExpectancy, y = ~Schooling, z = ~UnderFiveDeaths, color = ~cluster,colors = c("blue", "red"), size = 2) %>% 
+  add_markers() %>% layout(
+      title = "K-means Clustering of Three Variables",
+      scene = list(xaxis = list(title = "Life Expectancy"), yaxis = list(title = "Schooling"), zaxis = list(title = "UnderFiveDeaths"))
+    )
+```
+
+This plot is not particularly easy to understand. It looks like most of the separation occurs in the `LifeExpectancy`/`Schooling` plane.
+In this plane it is possible to see clusters, but they are not necessarily the strongest clusters. When life expectancy is 60-70 it is hard to determine the divide.
+```{r 2d_plot_kmeans}
+ggplot(data = data) +
+  geom_point( aes(x = LifeExpectancy, y = Schooling, color = cluster)) +
+  scale_color_manual(values = c("blue", "red")) + geom_point(
+    data = unscaled_centers, aes(x = LifeExpectancy, y = Schooling), color = "black", size = 5
+  ) + geom_text(
+    data = unscaled_centers, aes(
+      x = LifeExpectancy, y = Schooling, label = c("Center 1", "Center 2")
+    ), hjust = 0, vjust = 1.5) + labs(
+    title = "K-means Clustering of Two Variables", 
+    x = "Life Expectancy", y = "Schooling"
+  )
+```
+
+It is also possible to create an elbow plot to examine if there would be a better number of clusters.
+```{r elbow_plot}
+within_cluster_ss <- NULL
+k_val <- 2:15
+for (k in k_val) {
+  within_cluster_ss <- append(
+    within_cluster_ss, kmeans(cluster_data, centers = k)$tot.withinss
+  )
+}
+elbow_data <- data.frame(k_val, within_cluster_ss)
+ggplot(data = elbow_data, aes(x = k_val, y = within_cluster_ss)) + geom_line() + 
+  geom_point() + labs(
+    title = "Elbow Graph for K-clusters of LifeExpectancy, Schooling and UnderFiveDeaths",
+    x = "Number of clusters", y = "Total within-cluster sum of squares"
+  )
+```
+
+This suggests there may be an optimal k at k = 4, but this may not have any actual meaning. This will not be done here but further studies could analyse the effectiveness of different k values.
